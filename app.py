@@ -1,8 +1,8 @@
 import os
 import re
-import streamlit as st
-import pandas as pd
 import numpy as np
+import pandas as pd
+import streamlit as st
 
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import MinMaxScaler
@@ -12,240 +12,225 @@ from langchain.prompts import ChatPromptTemplate
 
 
 # ============================================================
-# AGENT 1: Workbook ingestion + worksheet discovery
+# AGENT 1: XLSX ingestion + layout understanding
 # ============================================================
 
 @st.cache_data(show_spinner=False)
 def load_workbook_sheets(uploaded_file) -> dict:
-    """Read all sheets from an .xlsx and return dict {sheet_name: cleaned_df}."""
+    """
+    Read all sheets as raw grids (header=None) so we can detect internal header rows
+    like 'Mar-16 ... Mar-25' even when pandas would call them Unnamed columns.
+    """
     xls = pd.ExcelFile(uploaded_file, engine="openpyxl")
     sheets = {}
     for name in xls.sheet_names:
-        df = pd.read_excel(xls, sheet_name=name, engine="openpyxl")
+        df = pd.read_excel(xls, sheet_name=name, engine="openpyxl", header=None)
         df = df.dropna(how="all").dropna(axis=1, how="all")
         sheets[name] = df
     return sheets
 
 
-def classify_sheet(df: pd.DataFrame, sheet_name: str) -> str:
-    """Heuristic classification: income_statement / balance_sheet / cashflow / other."""
-    text = (sheet_name + " " + " ".join(map(str, df.columns))).lower()
+def classify_sheet(df_raw: pd.DataFrame, sheet_name: str) -> str:
+    """
+    Heuristic classification using sheet name and a small text scan of top rows.
+    """
+    sample_text = " ".join(df_raw.head(20).astype(str).fillna("").values.ravel().tolist())
+    text = (sheet_name + " " + sample_text).lower()
 
-    income_kw = ["income", "profit", "loss", "p&l", "p and l", "revenue", "sales", "ebit", "pbt", "pat", "expenses"]
-    bs_kw = ["balance", "assets", "liabilities", "equity", "shareholders", "borrowings", "net worth"]
-    cf_kw = ["cash", "cashflow", "cash flow", "operating activities", "investing activities", "financing activities"]
+    income_kw = ["profit", "loss", "p&l", "p and l", "income statement", "revenue", "sales", "operating profit", "pat", "pbt"]
+    bs_kw = ["balance sheet", "assets", "liabilities", "equity", "net worth", "borrowings", "reserves", "share capital"]
+    cf_kw = ["cash flow", "cashflow", "operating activities", "investing activities", "financing activities"]
 
-    def score(keywords):
-        return sum(1 for k in keywords if k in text)
+    def score(keys):
+        return sum(1 for k in keys if k in text)
 
-    s_income = score(income_kw)
-    s_bs = score(bs_kw)
-    s_cf = score(cf_kw)
-
-    best = max(s_income, s_bs, s_cf)
+    si, sb, sc = score(income_kw), score(bs_kw), score(cf_kw)
+    best = max(si, sb, sc)
     if best == 0:
         return "other"
-    if best == s_income:
+    if best == si:
         return "income_statement"
-    if best == s_bs:
+    if best == sb:
         return "balance_sheet"
     return "cashflow"
 
 
-def _guess_label_column(df: pd.DataFrame):
-    """Pick a likely label/line-item column (mostly text)."""
-    best_col, best_ratio = None, -1
-    for c in df.columns:
-        s = df[c].astype(str)
-        text_ratio = (s.str.contains(r"[A-Za-z]", regex=True, na=False)).mean()
+def detect_year_header_row(df_raw: pd.DataFrame, max_scan_rows: int = 120):
+    """
+    Detect the internal header row that contains multiple year-like tokens.
+    Works for: Mar-16, Mar-17, FY22, 2022, 2022-23 etc.
+    Returns: (header_row_index, year_col_indices, year_labels)
+    """
+    patterns = [
+        r"\bmar-\d{2}\b", r"\bjun-\d{2}\b", r"\bsep-\d{2}\b", r"\bdec-\d{2}\b",
+        r"\bfy\s?\d{2,4}\b", r"\b20\d{2}\b", r"\b\d{4}-\d{2}\b"
+    ]
+
+    best = None  # (row_idx, matches[(col_idx, token)])
+    nrows = min(len(df_raw), max_scan_rows)
+
+    for i in range(nrows):
+        row = df_raw.iloc[i].astype(str).fillna("").str.lower().map(lambda x: x.strip())
+        matches = []
+        for j, cell in enumerate(row.tolist()):
+            if cell in ["", "nan", "none"]:
+                continue
+            if any(re.search(p, cell) for p in patterns):
+                matches.append((j, cell))
+
+        # Need at least 4 year-like headers to be confident
+        if len(matches) >= 4:
+            if best is None or len(matches) > len(best[1]):
+                best = (i, matches)
+
+    if best is None:
+        return None, [], []
+
+    header_row, matches = best
+    year_cols = [j for j, _ in matches]
+    year_labels = [df_raw.iloc[header_row, j] for j in year_cols]
+    return header_row, year_cols, year_labels
+
+
+def build_statement_table(df_raw: pd.DataFrame):
+    """
+    Converts a raw statement grid into a clean table by:
+      - finding the year header row inside the sheet
+      - selecting label column (Narration-like) from the left
+      - using year labels as columns
+    Returns: (table_df, label_col_name, year_col_names)
+    """
+    header_row, year_cols_idx, year_labels = detect_year_header_row(df_raw)
+    if header_row is None:
+        return None, None, None
+
+    # Label column: pick a likely narration col from the first few columns
+    # Choose the column with highest text ratio in rows below header_row.
+    candidate_cols = list(range(min(5, df_raw.shape[1])))
+    best_label_idx, best_ratio = 0, -1
+    for c in candidate_cols:
+        s = df_raw.iloc[header_row+1:header_row+60, c].astype(str).fillna("")
+        text_ratio = (s.str.contains(r"[A-Za-z]", regex=True)).mean()
         if text_ratio > best_ratio:
             best_ratio = text_ratio
-            best_col = c
-    return best_col
+            best_label_idx = c
+
+    use_cols = [best_label_idx] + year_cols_idx
+    sub = df_raw.iloc[header_row+1:, use_cols].copy()
+
+    # Name columns
+    label_col_name = "Narration"
+    year_col_names = [str(x).strip() for x in year_labels]
+    sub.columns = [label_col_name] + year_col_names
+
+    # Clean narration
+    sub[label_col_name] = sub[label_col_name].astype(str).fillna("").str.strip()
+    sub = sub[sub[label_col_name] != ""]
+    sub = sub[~sub[label_col_name].str.lower().isin(["nan", "none"])]
+
+    # Remove separator blocks
+    sub = sub[~sub[label_col_name].str.lower().str.contains(r"ratios|trends|---", na=False)]
+
+    # Numeric coercion for year columns
+    for yc in year_col_names:
+        sub[yc] = pd.to_numeric(sub[yc], errors="coerce")
+
+    return sub, label_col_name, year_col_names
 
 
-def _guess_year_columns(df: pd.DataFrame, label_col):
-    """Pick year columns based on header containing digits."""
-    year_cols = []
-    for c in df.columns:
-        if c == label_col:
-            continue
-        cs = str(c)
-        if any(ch.isdigit() for ch in cs):
-            year_cols.append(c)
-    return year_cols
+def year_to_int_from_header(h):
+    """
+    Convert 'Mar-16' -> 2016, 'FY22' -> 2022, '2022-23' -> 2022, '2022' -> 2022.
+    If cannot, return None.
+    """
+    s = str(h).lower().strip()
 
-
-def _standardize_year_header(x):
-    """Convert headers like FY 2022, 2022-23, FY22 etc into year int when possible."""
-    s = str(x)
     m = re.search(r"(20\d{2})", s)
     if m:
         return int(m.group(1))
-    m2 = re.search(r"\b(\d{2})\b", s)
-    # FY22 often means 2022 (assume 20xx)
-    if m2:
-        yy = int(m2.group(1))
-        if 0 <= yy <= 99:
-            return 2000 + yy
+
+    m = re.search(r"\b(\d{2})\b", s)  # Mar-16
+    if m and ("mar" in s or "jun" in s or "sep" in s or "dec" in s or "fy" in s):
+        yy = int(m.group(1))
+        return 2000 + yy
+
+    m = re.search(r"\b(\d{4})-\d{2}\b", s)
+    if m:
+        return int(m.group(1))
+
     return None
 
 
-def extract_timeseries_from_statement(
-    df: pd.DataFrame,
-    label_map: dict,
-    label_col=None,
-    year_cols=None
-) -> pd.DataFrame:
+def find_lineitem_row(table_df: pd.DataFrame, label_col: str, keywords: list):
+    labels = table_df[label_col].astype(str).str.lower()
+    for idx, lab in enumerate(labels.tolist()):
+        if any(k in lab for k in keywords):
+            return idx
+    return None
+
+
+def extract_timeseries(table_df: pd.DataFrame, label_col: str, year_cols: list, keywords: list):
     """
-    Extract year-wise values from a statement where:
-      - a label column contains line items
-      - other columns represent years
-    label_map: canonical_field -> list[keyword]
+    Extract a year-wise series for a given metric based on keyword match in Narration.
+    Returns df: year, value
     """
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+    idx = find_lineitem_row(table_df, label_col, keywords)
+    if idx is None:
+        return None
 
-    if label_col is None:
-        label_col = _guess_label_column(df)
-    if label_col is None:
-        return pd.DataFrame()
-
-    if year_cols is None:
-        year_cols = _guess_year_columns(df, label_col)
-    if not year_cols:
-        return pd.DataFrame()
-
-    # Prepare label text
-    labels = df[label_col].astype(str).str.lower().str.strip()
-
-    # Build extraction
-    out = {"year": []}
-    for canon in label_map.keys():
-        out[canon] = []
-
-    # Convert year headers
-    year_header_to_year = {}
+    out = {"year": [], "value": []}
     for yc in year_cols:
-        yr = _standardize_year_header(yc)
-        year_header_to_year[yc] = yr
-
-    for yc in year_cols:
-        yr = year_header_to_year.get(yc)
-        out["year"].append(yr if yr is not None else str(yc))
-
-        for canon, keywords in label_map.items():
-            # choose first row match by keyword
-            idx = None
-            for i, lab in enumerate(labels):
-                if any(k in lab for k in keywords):
-                    idx = i
-                    break
-            if idx is None:
-                out[canon].append(np.nan)
-            else:
-                val = df.iloc[idx][yc]
-                out[canon].append(pd.to_numeric(val, errors="coerce"))
-
-    res = pd.DataFrame(out)
-    # Try to coerce year to int if possible
-    res["year"] = pd.to_numeric(res["year"], errors="coerce")
-    res = res.dropna(subset=["year"])
-    if not res.empty:
-        res["year"] = res["year"].astype(int)
-    return res
+        yr = year_to_int_from_header(yc)
+        val = table_df.iloc[idx][yc]
+        out["year"].append(yr if yr is not None else yc)
+        out["value"].append(pd.to_numeric(val, errors="coerce"))
+    df = pd.DataFrame(out)
+    df["year"] = pd.to_numeric(df["year"], errors="coerce")
+    df = df.dropna(subset=["year"])
+    df["year"] = df["year"].astype(int)
+    return df
 
 
-def extraction_quality(df_std: pd.DataFrame, required_fields: list) -> float:
-    """Fraction of non-null values across required fields."""
-    if df_std.empty:
-        return 0.0
-    total = len(df_std) * len(required_fields)
-    nonnull = df_std[required_fields].notna().sum().sum()
-    return nonnull / max(total, 1)
-
-
-def manual_metric_picker(df: pd.DataFrame, label_col, year_cols, canonical_to_keywords):
+def manual_row_picker(table_df: pd.DataFrame, label_col: str, year_cols: list, canon_name: str):
     """
-    Manual rescue UI: user selects the exact row for each canonical metric.
-    Returns a standardized year-wise DataFrame.
+    Manual rescue: pick exact row label for a metric, return its year-wise series.
     """
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+    labels = table_df[label_col].astype(str).fillna("")
+    show = labels.head(400).tolist()
 
-    labels = df[label_col].astype(str)
-    labels_l = labels.str.lower()
+    st.markdown(f"**Manual pick for:** `{canon_name}`")
+    query = st.text_input(f"Search label ({canon_name})", value="", key=f"q_{canon_name}")
 
-    # Map year headers -> int year
-    years = []
-    for yc in year_cols:
-        yr = _standardize_year_header(yc)
-        years.append((yc, yr if yr is not None else str(yc)))
-
-    out = {"year": [y for _, y in years]}
-    for canon in canonical_to_keywords.keys():
-        out[canon] = [np.nan] * len(years)
-
-    st.markdown("### Manual mapping (rescue)")
-    st.caption("Pick the exact row for each metric. This makes the tool work with almost any statement layout.")
-
-    for canon, kws in canonical_to_keywords.items():
-        st.markdown(f"**Select row for:** `{canon}`")
-        default_search = kws[0] if kws else ""
-        query = st.text_input(f"Search label for {canon}", value=default_search, key=f"search_{canon}")
-
-        # Candidate rows based on search
-        if query.strip():
-            mask = labels_l.str.contains(query.lower(), na=False)
-            candidates = labels[mask].head(30).tolist()
-        else:
-            candidates = labels.head(30).tolist()
-
+    if query.strip():
+        mask = labels.str.lower().str.contains(query.lower(), na=False)
+        candidates = labels[mask].head(50).tolist()
         if not candidates:
-            candidates = labels.head(30).tolist()
+            candidates = show[:50]
+    else:
+        candidates = show[:50]
 
-        selected_label = st.selectbox(f"Row label for {canon}", options=candidates, key=f"pick_{canon}")
-        # Find first matching index
-        idx_list = df.index[labels == selected_label].tolist()
-        idx = idx_list[0] if idx_list else None
+    picked = st.selectbox(f"Pick row label for {canon_name}", options=candidates, key=f"pick_{canon_name}")
 
-        if idx is None:
-            continue
+    idx_list = table_df.index[labels == picked].tolist()
+    if not idx_list:
+        return None
+    idx = table_df.index.get_loc(idx_list[0])
 
-        # Fill year-wise values
-        for j, (yc, yr) in enumerate(years):
-            val = df.loc[idx, yc]
-            out[canon][j] = pd.to_numeric(val, errors="coerce")
+    out = {"year": [], "value": []}
+    for yc in year_cols:
+        yr = year_to_int_from_header(yc)
+        out["year"].append(yr if yr is not None else yc)
+        out["value"].append(pd.to_numeric(table_df.iloc[idx][yc], errors="coerce"))
 
-        st.divider()
-
-    res = pd.DataFrame(out)
-    res["year"] = pd.to_numeric(res["year"], errors="coerce")
-    res = res.dropna(subset=["year"])
-    if not res.empty:
-        res["year"] = res["year"].astype(int)
-    return res
-
-
-# Canonical label maps
-PL_LABELS = {
-    "sales": ["revenue", "sales", "turnover", "total income", "income from operations"],
-    "ebit": ["ebit", "operating profit", "profit from operations", "operating income"],
-    "ebt": ["profit before tax", "pbt", "ebt", "profit before taxation"],
-    "net_income": ["profit after tax", "pat", "net profit", "profit for the year"],
-    "interest_expense": ["finance cost", "finance costs", "interest", "interest expense", "borrowing cost"],
-    "tax_expense": ["tax", "income tax", "tax expense", "taxation"],
-}
-
-BS_LABELS = {
-    "total_assets": ["total assets", "assets"],
-    "total_equity": ["total equity", "shareholders", "shareholder", "net worth", "equity"],
-    "total_debt": ["borrowings", "total debt", "loans", "debt"],
-}
+    df = pd.DataFrame(out)
+    df["year"] = pd.to_numeric(df["year"], errors="coerce")
+    df = df.dropna(subset=["year"])
+    df["year"] = df["year"].astype(int)
+    return df
 
 
 # ============================================================
-# AGENT 2: DuPont + Modified DuPont + AI anomaly scoring
+# AGENT 2: DuPont + Modified DuPont + AI scoring
 # ============================================================
 
 def compute_dupont_components(df: pd.DataFrame) -> pd.DataFrame:
@@ -275,7 +260,6 @@ def compute_dupont_components(df: pd.DataFrame) -> pd.DataFrame:
     df["leverage_de_ratio"] = df["total_debt"] / (df["total_equity"] + eps)
 
     df["roe_from_spread"] = df["operating_roa"] + df["spread"] * df["leverage_de_ratio"]
-
     return df
 
 
@@ -294,14 +278,12 @@ def add_ai_anomaly_scores(df: pd.DataFrame) -> pd.DataFrame:
     df["pattern_anomaly_score"] = np.nan
     df["anomaly_score_raw"] = np.nan
 
-    if len(valid_idx) >= 10:
+    if len(valid_idx) >= 8:
         X = feature_df.loc[valid_idx].values
-        iso = IsolationForest(n_estimators=300, contamination=0.1, random_state=42)
+        iso = IsolationForest(n_estimators=250, contamination=0.15, random_state=42)
         iso.fit(X)
-
-        raw = -iso.score_samples(X)
+        raw = -iso.score_samples(X)  # higher is more anomalous
         scaled = MinMaxScaler((0, 100)).fit_transform(raw.reshape(-1, 1)).flatten()
-
         df.loc[valid_idx, "anomaly_score_raw"] = raw
         df.loc[valid_idx, "pattern_anomaly_score"] = scaled
 
@@ -347,7 +329,7 @@ def run_analysis(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# AGENT 4: LLM explanation (LangChain + OpenAI)
+# AGENT 4: LLM explanation (optional)
 # ============================================================
 
 def llm_client():
@@ -389,11 +371,11 @@ Pattern Anomaly Score: {anom}
 Recent ROE history: {roe_history}
 
 Explain:
-1) Main drivers of ROE (margin vs efficiency vs leverage).
+1) Main ROE drivers (margin vs efficiency vs leverage).
 2) Whether ROE quality looks operational or leverage-driven.
 3) What the score implies (low/moderate/high concern).
 4) What an auditor should check next (2–3 concrete checks).
-Keep it factual; do not claim fraud as fact.
+Do not claim fraud as fact; flag as risk signals only.
 """
     )
 
@@ -419,40 +401,35 @@ Keep it factual; do not claim fraud as fact.
 
 
 # ============================================================
-# STREAMLIT APP
+# STREAMLIT UI
 # ============================================================
 
-st.set_page_config(page_title="Intelligent DuPont Fraud Score (XLSX)", layout="wide")
-st.title("🧠 Intelligent DuPont Fraud Score – XLSX Multi-Sheet (Agent Workflow)")
+st.set_page_config(page_title="DuPont Fraud Score (XLSX Agent)", layout="wide")
+st.title("🧠 Intelligent DuPont Fraud Score — XLSX Multi-Sheet Agent")
 
 st.write(
-    "Upload an **Excel (.xlsx)** file with multiple worksheets. "
-    "**Agent 1** discovers sheets and extracts key statement items, "
-    "**Agent 2** computes DuPont + anomaly score, "
-    "**Agent 3** visualizes it, "
-    "**Agent 4** explains it via LangChain + LLM."
+    "Upload an **Excel (.xlsx)** file (like your Tata Steel template). "
+    "Agent 1 auto-detects the year header row (e.g., Mar-16…Mar-25), extracts statement line items, "
+    "then DuPont + AI anomaly detection runs end-to-end."
 )
 
 st.sidebar.header("📥 Upload Excel")
 uploaded = st.sidebar.file_uploader("Upload .xlsx", type=["xlsx"])
 
 if uploaded is None:
-    st.info("Upload an Excel (.xlsx) file to begin.")
+    st.info("Upload an Excel file to begin.")
     st.stop()
 
-# Agent 1: load workbook
 sheets = load_workbook_sheets(uploaded)
 sheet_names = list(sheets.keys())
 sheet_types = {n: classify_sheet(sheets[n], n) for n in sheet_names}
 
-st.sidebar.subheader("Agent 1: Worksheet Discovery")
-st.sidebar.write(f"Found **{len(sheet_names)}** sheets")
-
+st.sidebar.subheader("Agent 1: Sheet selection")
 income_candidates = [n for n, t in sheet_types.items() if t == "income_statement"]
 bs_candidates = [n for n, t in sheet_types.items() if t == "balance_sheet"]
 
 income_sheet = st.sidebar.selectbox(
-    "Select Income Statement / P&L sheet",
+    "Select P&L / Profit & Loss sheet",
     options=sheet_names,
     index=sheet_names.index(income_candidates[0]) if income_candidates else 0
 )
@@ -462,98 +439,153 @@ bs_sheet = st.sidebar.selectbox(
     index=sheet_names.index(bs_candidates[0]) if bs_candidates else 0
 )
 
-st.subheader("🧾 Agent 1 Output: Workbook structure")
-cA, cB = st.columns(2)
-with cA:
-    st.write("**Income Statement / P&L Preview**")
-    st.caption(f"Selected: {income_sheet} (auto-tag: {sheet_types[income_sheet]})")
-    st.dataframe(sheets[income_sheet].head(20), use_container_width=True)
-
-with cB:
-    st.write("**Balance Sheet Preview**")
-    st.caption(f"Selected: {bs_sheet} (auto-tag: {sheet_types[bs_sheet]})")
-    st.dataframe(sheets[bs_sheet].head(20), use_container_width=True)
-
 st.sidebar.subheader("Metadata")
 company_name = st.sidebar.text_input("Company name", value="Unknown Company")
 industry_name = st.sidebar.text_input("Industry", value="Unknown Industry")
 
-st.sidebar.subheader("Extraction Mode")
-mode = st.sidebar.radio("Choose extraction mode", ["Auto (recommended)", "Manual (if auto fails)"], index=0)
+st.sidebar.subheader("Extraction mode")
+mode = st.sidebar.radio("Mode", ["Auto (agent)", "Manual rescue"], index=0)
 
-# Agent 1: extract
-pl_source = sheets[income_sheet]
-bs_source = sheets[bs_sheet]
+pl_raw = sheets[income_sheet]
+bs_raw = sheets[bs_sheet]
 
-if mode == "Auto (recommended)":
-    pl_df = extract_timeseries_from_statement(pl_source, PL_LABELS)
-    bs_df = extract_timeseries_from_statement(bs_source, BS_LABELS)
+# Build statement tables
+pl_table, pl_label_col, pl_year_cols = build_statement_table(pl_raw)
+bs_table, bs_label_col, bs_year_cols = build_statement_table(bs_raw)
+
+st.subheader("🧾 Agent 1 Output: Workbook structure")
+c1, c2 = st.columns(2)
+
+with c1:
+    st.write("**P&L Raw Preview (top 30 rows)**")
+    st.caption(f"Sheet: {income_sheet} (auto-tag: {sheet_types[income_sheet]})")
+    st.dataframe(pl_raw.head(30), use_container_width=True)
+
+with c2:
+    st.write("**Balance Sheet Raw Preview (top 30 rows)**")
+    st.caption(f"Sheet: {bs_sheet} (auto-tag: {sheet_types[bs_sheet]})")
+    st.dataframe(bs_raw.head(30), use_container_width=True)
+
+if pl_table is None or bs_table is None:
+    st.error(
+        "Could not detect the year header row in one or both sheets. "
+        "Switch to Manual rescue and choose a better sheet (or use a sheet with Mar-xx / FY / 20xx headers visible)."
+    )
+    st.stop()
+
+st.markdown("### Agent 1: Detected clean tables (preview)")
+cc1, cc2 = st.columns(2)
+with cc1:
+    st.write("**P&L table preview**")
+    st.caption(f"Detected year columns: {pl_year_cols[:8]}{'...' if len(pl_year_cols)>8 else ''}")
+    st.dataframe(pl_table.head(25), use_container_width=True)
+with cc2:
+    st.write("**Balance Sheet table preview**")
+    st.caption(f"Detected year columns: {bs_year_cols[:8]}{'...' if len(bs_year_cols)>8 else ''}")
+    st.dataframe(bs_table.head(25), use_container_width=True)
+
+# ---------- Auto extraction keywords (tuned for sheets like your screenshot) ----------
+PL_KEYWORDS = {
+    "sales": ["sales", "revenue", "turnover", "total income", "income from operations"],
+    "ebit": ["operating profit", "ebit", "profit from operations", "operating income"],
+    "interest_expense": ["interest", "finance cost", "finance costs", "borrowing cost"],
+    "ebt": ["profit before tax", "pbt", "ebt", "profit before taxation"],
+    "tax_expense": ["tax", "taxation", "income tax"],
+    "net_income": ["net profit", "profit after tax", "pat", "profit for the year"],
+}
+
+BS_KEYWORDS = {
+    "total_assets": ["total assets", "total", "assets"],  # tries total assets first; fallback may hit "Total"
+    "total_equity": ["total equity", "net worth", "shareholders", "shareholder", "equity", "reserves"],
+    "total_debt": ["borrowings", "total debt", "debt", "loans"],
+}
+
+# ---------- Extract series ----------
+def series_to_wide(name, s_df):
+    if s_df is None or s_df.empty:
+        return None
+    out = s_df.rename(columns={"value": name}).copy()
+    return out[["year", name]]
+
+if mode == "Auto (agent)":
+    sales_ts = series_to_wide("sales", extract_timeseries(pl_table, pl_label_col, pl_year_cols, PL_KEYWORDS["sales"]))
+    ebit_ts = series_to_wide("ebit", extract_timeseries(pl_table, pl_label_col, pl_year_cols, PL_KEYWORDS["ebit"]))
+    int_ts  = series_to_wide("interest_expense", extract_timeseries(pl_table, pl_label_col, pl_year_cols, PL_KEYWORDS["interest_expense"]))
+    ebt_ts  = series_to_wide("ebt", extract_timeseries(pl_table, pl_label_col, pl_year_cols, PL_KEYWORDS["ebt"]))
+    tax_ts  = series_to_wide("tax_expense", extract_timeseries(pl_table, pl_label_col, pl_year_cols, PL_KEYWORDS["tax_expense"]))
+    pat_ts  = series_to_wide("net_income", extract_timeseries(pl_table, pl_label_col, pl_year_cols, PL_KEYWORDS["net_income"]))
+
+    ta_ts   = series_to_wide("total_assets", extract_timeseries(bs_table, bs_label_col, bs_year_cols, BS_KEYWORDS["total_assets"]))
+    te_ts   = series_to_wide("total_equity", extract_timeseries(bs_table, bs_label_col, bs_year_cols, BS_KEYWORDS["total_equity"]))
+    td_ts   = series_to_wide("total_debt", extract_timeseries(bs_table, bs_label_col, bs_year_cols, BS_KEYWORDS["total_debt"]))
 
 else:
-    # Manual config for PL
-    st.markdown("## Manual extraction configuration")
-    st.caption("First configure P&L, then Balance Sheet.")
+    st.markdown("## Manual rescue mapping (when auto misses labels)")
+    st.caption("Pick the exact row for each metric from the detected tables.")
 
-    st.markdown("### P&L Manual Config")
-    label_col_pl = st.selectbox("P&L label column", options=list(pl_source.columns), index=0)
-    year_cols_pl = st.multiselect("P&L year columns", options=list(pl_source.columns), default=[c for c in pl_source.columns[1:5]])
-    pl_df = manual_metric_picker(pl_source, label_col_pl, year_cols_pl, PL_LABELS)
+    st.markdown("### P&L manual picks")
+    sales_ts = series_to_wide("sales", manual_row_picker(pl_table, pl_label_col, pl_year_cols, "sales"))
+    ebit_ts  = series_to_wide("ebit", manual_row_picker(pl_table, pl_label_col, pl_year_cols, "ebit (Operating Profit)"))
+    int_ts   = series_to_wide("interest_expense", manual_row_picker(pl_table, pl_label_col, pl_year_cols, "interest_expense"))
+    ebt_ts   = series_to_wide("ebt", manual_row_picker(pl_table, pl_label_col, pl_year_cols, "ebt (Profit before tax)"))
+    tax_ts   = series_to_wide("tax_expense", manual_row_picker(pl_table, pl_label_col, pl_year_cols, "tax_expense"))
+    pat_ts   = series_to_wide("net_income", manual_row_picker(pl_table, pl_label_col, pl_year_cols, "net_income (Net profit/PAT)"))
 
-    st.markdown("### Balance Sheet Manual Config")
-    label_col_bs = st.selectbox("BS label column", options=list(bs_source.columns), index=0)
-    year_cols_bs = st.multiselect("BS year columns", options=list(bs_source.columns), default=[c for c in bs_source.columns[1:5]])
-    bs_df = manual_metric_picker(bs_source, label_col_bs, year_cols_bs, BS_LABELS)
+    st.markdown("### Balance Sheet manual picks")
+    ta_ts    = series_to_wide("total_assets", manual_row_picker(bs_table, bs_label_col, bs_year_cols, "total_assets"))
+    te_ts    = series_to_wide("total_equity", manual_row_picker(bs_table, bs_label_col, bs_year_cols, "total_equity"))
+    td_ts    = series_to_wide("total_debt", manual_row_picker(bs_table, bs_label_col, bs_year_cols, "total_debt (Borrowings)"))
 
-# Merge standardized dataset
-if pl_df.empty or bs_df.empty:
-    st.error("Extraction produced no usable year-wise data. Switch to Manual mode and map rows/years explicitly.")
+series_list = [sales_ts, ebit_ts, int_ts, ebt_ts, tax_ts, pat_ts, ta_ts, te_ts, td_ts]
+series_list = [s for s in series_list if s is not None and not s.empty]
+
+if not series_list:
+    st.error("No metrics could be extracted. Switch to Manual rescue and pick rows explicitly.")
     st.stop()
 
-df_raw = pd.merge(pl_df, bs_df, on="year", how="outer")
-df_raw["company"] = company_name
-df_raw["industry"] = industry_name
+# Merge all series on year
+df_std = series_list[0]
+for s in series_list[1:]:
+    df_std = pd.merge(df_std, s, on="year", how="outer")
 
-# Required fields for analysis
-required_fin_cols = [
-    "sales", "net_income", "ebit", "ebt",
-    "total_assets", "total_equity", "total_debt",
-    "interest_expense", "tax_expense"
-]
+df_std["company"] = company_name
+df_std["industry"] = industry_name
 
-# Show extraction quality
-quality = extraction_quality(df_raw, required_fin_cols)
-st.subheader("✅ Agent 1 Output: Standardized dataset")
-st.caption(f"Extraction completeness score: **{quality:.0%}** (higher is better). If low, use Manual mode.")
-st.dataframe(df_raw.sort_values("year"), use_container_width=True)
+# Guard: required columns for DuPont pipeline
+required = ["sales", "net_income", "ebit", "ebt", "total_assets", "total_equity", "total_debt", "interest_expense", "tax_expense"]
+missing = [c for c in required if c not in df_std.columns]
+st.subheader("✅ Agent 1 Output: Standardized dataset (year-wise)")
+st.dataframe(df_std.sort_values("year"), use_container_width=True)
 
-# Basic guardrails
-if quality < 0.45:
+if missing:
     st.warning(
-        "Extraction completeness is low. This usually means your sheet layout/labels differ from the defaults. "
-        "Switch to **Manual** extraction mode for precise row selection."
+        f"Missing fields: {missing}. You can still proceed if most are present, "
+        "but for full DuPont you should fill them via Manual rescue."
     )
 
-# Agent 2: analysis
-df_raw_numeric = df_raw.copy()
-for col in required_fin_cols:
-    df_raw_numeric[col] = pd.to_numeric(df_raw_numeric[col], errors="coerce")
+# Drop years without enough data
+df_num = df_std.copy()
+for c in required:
+    if c in df_num.columns:
+        df_num[c] = pd.to_numeric(df_num[c], errors="coerce")
 
-df_raw_numeric = df_raw_numeric.dropna(subset=["year"])
-df_raw_numeric["year"] = df_raw_numeric["year"].astype(int)
+df_num = df_num.dropna(subset=["year"])
+df_num["year"] = df_num["year"].astype(int)
 
-df = run_analysis(df_raw_numeric)
-
-# Agent 3: dashboard selection
-st.sidebar.header("📌 Select Year")
-years = df["year"].sort_values().unique().tolist()
-if not years:
-    st.error("No valid years after cleaning. Check extraction and ensure year columns are correct.")
+# Require at least some core fields
+core_needed = ["sales", "net_income", "total_assets", "total_equity"]
+if any(df_num.get(c, pd.Series(dtype=float)).isna().all() for c in core_needed):
+    st.error("Not enough core fields to run DuPont (need sales, net_income, total_assets, total_equity). Use Manual rescue.")
     st.stop()
 
-selected_year = st.sidebar.selectbox("Year (detailed view)", years, index=len(years) - 1)
+# Run analysis
+df = run_analysis(df_num)
+
+st.sidebar.header("📌 Select Year")
+years = df["year"].sort_values().unique().tolist()
+selected_year = st.sidebar.selectbox("Year (detailed view)", years, index=len(years)-1)
 row = df[df["year"] == selected_year].iloc[0]
 
-# Top KPIs
 st.subheader(f"📊 Dashboard: {company_name} — {selected_year}")
 
 k1, k2, k3, k4 = st.columns(4)
@@ -563,7 +595,7 @@ k2.caption(f"Risk: **{risk_label(row['dupont_fraud_score'])}**")
 k3.metric("Operating Quality Risk", f"{row['operating_quality_risk']:.1f}")
 k4.metric("Leverage Risk", f"{row['leverage_risk']:.1f}")
 
-tab1, tab2, tab3, tab4 = st.tabs(["Classic DuPont", "Modified DuPont", "AI Explanation Agent", "Full Table"])
+tab1, tab2, tab3, tab4 = st.tabs(["Classic DuPont", "Modified DuPont", "AI Explanation", "Full Table"])
 
 with tab1:
     st.subheader("Classic 3-step DuPont")
@@ -572,11 +604,11 @@ with tab1:
     b.metric("Asset Turnover", f"{row['asset_turnover']:.2f}x")
     c.metric("Equity Multiplier", f"{row['equity_multiplier']:.2f}x")
 
-    st.markdown("#### Trend: ROE + DuPont Components")
+    st.markdown("#### Trend: ROE + DuPont components")
     st.line_chart(df.set_index("year")[["roe", "net_profit_margin", "asset_turnover", "equity_multiplier"]])
 
 with tab2:
-    st.subheader("Modified DuPont (5-step) + Operating vs Leverage")
+    st.subheader("Modified DuPont + Operating vs Leverage")
     a, b, c, d, e = st.columns(5)
     a.metric("Tax Burden (NI/EBT)", f"{row['tax_burden']:.2f}")
     b.metric("Interest Burden (EBT/EBIT)", f"{row['interest_burden']:.2f}")
@@ -584,11 +616,11 @@ with tab2:
     d.metric("Operating ROA", f"{row['operating_roa']*100:.2f}%")
     e.metric("Debt/Equity", f"{row['leverage_de_ratio']:.2f}x")
 
-    st.markdown("#### Trend: Operating ROA, Leverage, Spread")
+    st.markdown("#### Trend: Operating ROA, leverage, spread")
     st.line_chart(df.set_index("year")[["operating_roa", "leverage_de_ratio", "spread"]])
 
 with tab3:
-    st.subheader("AI + Explanation Agent (LangChain)")
+    st.subheader("AI Explanation Agent (LangChain + OpenAI)")
     st.write("Pattern Anomaly Score:", "N/A" if pd.isna(row["pattern_anomaly_score"]) else f"{row['pattern_anomaly_score']:.1f}")
 
     explanation = generate_llm_explanation(row, df.sort_values("year"))
@@ -596,16 +628,16 @@ with tab3:
         st.write(explanation)
         st.caption("Generated via LangChain + OpenAI. Add OPENAI_API_KEY in Streamlit Secrets.")
     else:
-        st.warning("OPENAI_API_KEY not found (or not set in Streamlit Secrets). Using rule-based explanation.")
+        st.warning("OPENAI_API_KEY not found. Showing rule-based explanation.")
         lines = []
-        lines.append(f"- DuPont Fraud Score is **{row['dupont_fraud_score']:.1f}** ({risk_label(row['dupont_fraud_score'])}).")
+        lines.append(f"- Fraud Score is **{row['dupont_fraud_score']:.1f}** ({risk_label(row['dupont_fraud_score'])}).")
         if row["leverage_risk"] > row["operating_quality_risk"]:
-            lines.append("- Leverage risk dominates: ROE may be amplified by capital structure rather than operations.")
+            lines.append("- Leverage risk dominates: ROE could be amplified by capital structure rather than operations.")
         else:
-            lines.append("- Operating risk dominates: margins/operating ROA look more unusual than leverage.")
+            lines.append("- Operating risk dominates: margin/operating ROA looks more unusual than leverage.")
         if not pd.isna(row["pattern_anomaly_score"]) and row["pattern_anomaly_score"] > 60:
-            lines.append("- The overall DuPont pattern is statistically unusual vs the dataset; audit attention warranted.")
-        lines.append("- Next checks: revenue recognition notes, one-off income/expenses, related-party items, debt structure & covenants.")
+            lines.append("- Overall DuPont pattern is statistically unusual across years in this dataset.")
+        lines.append("- Suggested checks: revenue recognition notes, one-off income/expenses, related-party items, debt covenants and refinancing.")
         st.write("\n".join(lines))
 
 with tab4:
