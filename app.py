@@ -161,9 +161,17 @@ def year_to_int_from_header(h):
     return None
 
 
+# ===========================
+# CHANGE 1: safer matcher
+# ===========================
 def find_lineitem_row(table_df: pd.DataFrame, label_col: str, keywords: list):
     labels = table_df[label_col].astype(str).str.lower()
+
     for idx, lab in enumerate(labels.tolist()):
+        # Skip classic trap: "profit before tax" being matched as tax expense
+        if "before tax" in lab and any(k in ["tax", "income tax", "tax expense"] for k in keywords):
+            continue
+
         if any(k in lab for k in keywords):
             return idx
     return None
@@ -490,14 +498,20 @@ PL_KEYWORDS = {
     "ebit": ["operating profit", "ebit", "profit from operations", "operating income"],
     "interest_expense": ["interest", "finance cost", "finance costs", "borrowing cost"],
     "ebt": ["profit before tax", "pbt", "ebt", "profit before taxation"],
-    "tax_expense": ["tax", "taxation", "income tax"],
+    # ===========================
+    # CHANGE 2: tighten tax keywords to avoid matching "profit before tax"
+    # ===========================
+    "tax_expense": ["tax expense", "income tax", "current tax", "deferred tax", "total tax"],
     "net_income": ["net profit", "profit after tax", "pat", "profit for the year"],
 }
 
+# ===========================
+# CHANGE 3: tighten BS keywords to avoid "total" / generic equity collisions
+# ===========================
 BS_KEYWORDS = {
-    "total_assets": ["total assets", "total", "assets"],  # tries total assets first; fallback may hit "Total"
-    "total_equity": ["total equity", "net worth", "shareholders", "shareholder", "equity", "reserves"],
-    "total_debt": ["borrowings", "total debt", "debt", "loans"],
+    "total_assets": ["total assets"],
+    "total_equity": ["total equity", "shareholders' funds", "shareholders funds", "net worth", "total shareholders"],
+    "total_debt": ["borrowings", "total borrowings", "total debt", "loans"],
 }
 
 # ---------- Extract series ----------
