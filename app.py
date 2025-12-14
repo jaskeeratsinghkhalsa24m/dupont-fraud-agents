@@ -161,17 +161,9 @@ def year_to_int_from_header(h):
     return None
 
 
-# ===========================
-# CHANGE 1: safer matcher
-# ===========================
 def find_lineitem_row(table_df: pd.DataFrame, label_col: str, keywords: list):
     labels = table_df[label_col].astype(str).str.lower()
-
     for idx, lab in enumerate(labels.tolist()):
-        # Skip classic trap: "profit before tax" being matched as tax expense
-        if "before tax" in lab and any(k in ["tax", "income tax", "tax expense"] for k in keywords):
-            continue
-
         if any(k in lab for k in keywords):
             return idx
     return None
@@ -255,14 +247,23 @@ def compute_dupont_components(df: pd.DataFrame) -> pd.DataFrame:
     df["interest_burden"] = df["ebt"] / (df["ebit"] + eps)
     df["operating_margin"] = df["ebit"] / (df["sales"] + eps)
 
-    df["tax_rate_est"] = df["tax_expense"] / (df["ebt"] + eps)
-    df["tax_rate_est"] = df["tax_rate_est"].clip(lower=0, upper=0.7)
+    # ---- CHANGE: tax_expense is optional; if missing, use fallback tax rate ----
+    if "tax_expense" in df.columns and not df["tax_expense"].isna().all():
+        df["tax_rate_est"] = df["tax_expense"] / (df["ebt"] + eps)
+        df["tax_rate_est"] = df["tax_rate_est"].clip(lower=0, upper=0.7)
+    else:
+        df["tax_rate_est"] = 0.25
 
     df["nopat"] = df["ebit"] * (1 - df["tax_rate_est"])
     df["operating_roa"] = df["nopat"] / (df["total_assets"] + eps)
 
-    df["gross_cost_of_debt"] = df["interest_expense"] / (df["total_debt"] + eps)
-    df["after_tax_cost_of_debt"] = df["gross_cost_of_debt"] * (1 - df["tax_rate_est"])
+    # ---- CHANGE: safe handling if interest_expense/total_debt are missing ----
+    if "interest_expense" in df.columns and "total_debt" in df.columns:
+        df["gross_cost_of_debt"] = df["interest_expense"] / (df["total_debt"] + eps)
+        df["after_tax_cost_of_debt"] = df["gross_cost_of_debt"] * (1 - df["tax_rate_est"])
+    else:
+        df["gross_cost_of_debt"] = np.nan
+        df["after_tax_cost_of_debt"] = np.nan
 
     df["spread"] = df["operating_roa"] - df["after_tax_cost_of_debt"]
     df["leverage_de_ratio"] = df["total_debt"] / (df["total_equity"] + eps)
@@ -498,20 +499,14 @@ PL_KEYWORDS = {
     "ebit": ["operating profit", "ebit", "profit from operations", "operating income"],
     "interest_expense": ["interest", "finance cost", "finance costs", "borrowing cost"],
     "ebt": ["profit before tax", "pbt", "ebt", "profit before taxation"],
-    # ===========================
-    # CHANGE 2: tighten tax keywords to avoid matching "profit before tax"
-    # ===========================
-    "tax_expense": ["tax expense", "income tax", "current tax", "deferred tax", "total tax"],
+    "tax_expense": ["tax", "taxation", "income tax"],
     "net_income": ["net profit", "profit after tax", "pat", "profit for the year"],
 }
 
-# ===========================
-# CHANGE 3: tighten BS keywords to avoid "total" / generic equity collisions
-# ===========================
 BS_KEYWORDS = {
-    "total_assets": ["total assets"],
-    "total_equity": ["total equity", "shareholders' funds", "shareholders funds", "net worth", "total shareholders"],
-    "total_debt": ["borrowings", "total borrowings", "total debt", "loans"],
+    "total_assets": ["total assets", "total", "assets"],  # tries total assets first; fallback may hit "Total"
+    "total_equity": ["total equity", "net worth", "shareholders", "shareholder", "equity", "reserves"],
+    "total_debt": ["borrowings", "total debt", "debt", "loans"],
 }
 
 # ---------- Extract series ----------
@@ -579,9 +574,14 @@ if missing:
 
 # Drop years without enough data
 df_num = df_std.copy()
+
+# ---- CHANGE: ensure required columns exist (prevents KeyError if extraction missed them) ----
 for c in required:
-    if c in df_num.columns:
-        df_num[c] = pd.to_numeric(df_num[c], errors="coerce")
+    if c not in df_num.columns:
+        df_num[c] = np.nan
+
+for c in required:
+    df_num[c] = pd.to_numeric(df_num[c], errors="coerce")
 
 df_num = df_num.dropna(subset=["year"])
 df_num["year"] = df_num["year"].astype(int)
